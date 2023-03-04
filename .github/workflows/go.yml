@@ -26,3 +26,6 @@ jobs:
 
     - name: Test
       run: go test -v ./...
+
+    - name: Run
+      run: ./actions-metrics-exporter --user "$GITHUB_ACTOR" --token ${{ secrets.GITHUB_TOKEN }} --repository "${{ github.event.repository.name }}"

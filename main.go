@@ -134,10 +134,13 @@ func main() {
 		log.Printf("%d jobs for workflow run: %d", len(workflowJobs), run.GetID())
 		for _, job := range workflowJobs {
 
-			dur := job.GetCompletedAt().Time.Sub(job.GetStartedAt().Time)
-			allUsage += dur
-			log.Printf("Job: %d [%s - %s] (%s): %s",
-				job.GetID(), job.GetStartedAt().Format("2006-01-02 15:04:05"), job.GetCompletedAt().Format("2006-01-02 15:04:05"), dur.String(), job.GetConclusion())
+			if job.GetCompletedAt().Time.Unix() > job.GetStartedAt().Time.Unix() {
+				dur := job.GetCompletedAt().Time.Sub(job.GetStartedAt().Time)
+
+				allUsage += dur
+				log.Printf("Job: %d [%s - %s] (%s): %s",
+					job.GetID(), job.GetStartedAt().Format("2006-01-02 15:04:05"), job.GetCompletedAt().Format("2006-01-02 15:04:05"), dur.String(), job.GetConclusion())
+			}
 		}
 	}
 
