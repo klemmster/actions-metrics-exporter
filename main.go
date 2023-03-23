@@ -1,151 +1,130 @@
+// Copyright 2018 Palantir Technologies, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
 	"context"
-	"flag"
+	"encoding/json"
 	"fmt"
-	"log"
+	"net/http"
+	"os"
 	"time"
 
 	"github.com/google/go-github/v50/github"
-	"golang.org/x/oauth2"
+	"github.com/gregjones/httpcache"
+	"github.com/palantir/go-githubapp/githubapp"
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	// "github.com/rcrowley/go-metrics"
+
+	// "github.com/rcrowley/go-metrics"
+	"github.com/rs/zerolog"
 )
 
+type workflowJobHandler struct {
+	githubapp.ClientCreator
+}
+
+var durationGauge *prometheus.GaugeVec
+
+// Handle implements githubapp.EventHandler
+func (h *workflowJobHandler) Handle(ctx context.Context, eventType string, deliveryID string, payload []byte) error {
+	zerolog.Ctx(ctx).Debug().Msgf("Got event %s", eventType)
+	var event github.WorkflowJobEvent
+
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return errors.Wrap(err, "failed to parse workflow_job event")
+	}
+
+	zerolog.Ctx(ctx).Debug().Msgf("Event action is %s", event.GetAction())
+	if event.GetAction() != "completed" {
+		return nil
+	}
+
+	job := event.GetWorkflowJob()
+	dur := job.GetCompletedAt().Time.Sub(job.GetStartedAt().Time)
+
+	job.GetWorkflowName()
+	durationGauge.With(prometheus.Labels{
+		"job_id":        fmt.Sprint(job.GetID()),
+		"workflow_name": job.GetWorkflowName(),
+		"job_name":      job.GetName(),
+		"conclusion":    job.GetConclusion(),
+	}).Set(dur.Seconds())
+
+	return nil
+}
+
+// Handles implements githubapp.EventHandler
+func (*workflowJobHandler) Handles() []string {
+	return []string{"workflow_job"}
+}
+
+var _ githubapp.EventHandler = &workflowJobHandler{}
+
 func main() {
-
-	var (
-		userName, token, repositoryName string
-		since                           int
-	)
-
-	flag.StringVar(&userName, "user", "", "User name")
-	flag.StringVar(&token, "token", "", "GitHub token")
-	flag.StringVar(&repositoryName, "repository", "", "Repository")
-	flag.IntVar(&since, "since", 30, "Since when to fetch the data (in days)")
-
-	flag.Parse()
-
-	switch {
-	case userName == "":
-		log.Fatal("Username is required")
-	case token == "":
-		log.Fatal("Token is required")
-	case repositoryName == "":
-		log.Fatal("Repository is required")
-	}
-
-	auth := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
-	))
-
-	client := github.NewClient(auth)
-	created := time.Now().AddDate(0, 0, -since)
-	format := "2006-01-02"
-	createdQuery := ">=" + created.Format(format)
-
-	var (
-		totalRuns int
-		totalJobs int
-	)
-
-	fmt.Printf("Fetching last %d days of data (created>=%s)\n", since, created.Format("2006-01-02"))
-
-	var repo *github.Repository
-	var res *github.Response
-	var err error
-	ctx := context.Background()
-
-	page := 0
-
-	repo, res, err = client.Repositories.Get(ctx, userName, repositoryName)
+	config, err := ReadConfig("config.yml")
 	if err != nil {
-		log.Fatalf("Could not fetch repository: %s\n%v\n%v", repositoryName, res, err)
-		return
+		panic(err)
 	}
 
-	log.Printf("Found: %s", repo.GetFullName())
+	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+	zerolog.DefaultContextLogger = &logger
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
 
-	workflowRuns := []*github.WorkflowRun{}
-	allUsage := time.Second * 0
-	for {
+	durationGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "hf",
+			Subsystem: "github_actions",
+			Name:      "job_duration",
+			Help:      "TODO",
+		},
+		[]string{
+			"job_id",
+			"workflow_name",
+			"job_name",
+			// https://docs.github.com/webhooks-and-events/webhooks/webhook-events-and-payloads#workflow_job
+			"conclusion",
+		},
+	)
+	prometheus.MustRegister(durationGauge)
 
-		opts := &github.ListWorkflowRunsOptions{Created: createdQuery, ListOptions: github.ListOptions{Page: page, PerPage: 100}}
-
-		var runs *github.WorkflowRuns
-		log.Printf("Listing workflow runs for: %s", repositoryName)
-		realOwner := userName
-		// if user is a member of repository
-		if userName != *repo.Owner.Login {
-			realOwner = *repo.Owner.Login
-		}
-		runs, res, err = client.Actions.ListRepositoryWorkflowRuns(ctx, realOwner, repo.GetName(), opts)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		workflowRuns = append(workflowRuns, runs.WorkflowRuns...)
-
-		if len(workflowRuns) == 0 {
-			break
-		}
-
-		if res.NextPage == 0 {
-			break
-		}
-
-		page = res.NextPage
-	}
-	totalRuns += len(workflowRuns)
-
-	var entity string
-	if userName != "" {
-		entity = userName
-	}
-	log.Printf("Found %d workflow runs for %s/%s", len(workflowRuns), entity, repo.GetName())
-
-	for _, run := range workflowRuns {
-		log.Printf("Fetching jobs for: run ID: %d, startedAt: %s, conclusion: %s", run.GetID(), run.GetRunStartedAt().Format("2006-01-02 15:04:05"), run.GetConclusion())
-		workflowJobs := []*github.WorkflowJob{}
-
-		page := 0
-		for {
-			log.Printf("Fetching jobs for: %d, page %d", run.GetID(), page)
-			jobs, res, err := client.Actions.ListWorkflowJobs(ctx, entity,
-				repo.GetName(),
-				run.GetID(),
-				&github.ListWorkflowJobsOptions{Filter: "all", ListOptions: github.ListOptions{Page: page, PerPage: 100}})
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			workflowJobs = append(workflowJobs, jobs.Jobs...)
-
-			if len(jobs.Jobs) == 0 {
-				break
-			}
-
-			if res.NextPage == 0 {
-				break
-			}
-			page = res.NextPage
-		}
-
-		totalJobs += len(workflowJobs)
-		log.Printf("%d jobs for workflow run: %d", len(workflowJobs), run.GetID())
-		for _, job := range workflowJobs {
-
-			if job.GetCompletedAt().Time.Unix() > job.GetStartedAt().Time.Unix() {
-				dur := job.GetCompletedAt().Time.Sub(job.GetStartedAt().Time)
-
-				allUsage += dur
-				log.Printf("Job: %d [%s - %s] (%s): %s",
-					job.GetID(), job.GetStartedAt().Format("2006-01-02 15:04:05"), job.GetCompletedAt().Format("2006-01-02 15:04:05"), dur.String(), job.GetConclusion())
-			}
-		}
+	cc, err := githubapp.NewDefaultCachingClientCreator(
+		config.Github,
+		githubapp.WithClientUserAgent("actions-metrics-app/0.0.1"),
+		githubapp.WithClientTimeout(3*time.Second),
+		githubapp.WithClientCaching(false, func() httpcache.Cache { return httpcache.NewMemoryCache() }),
+	)
+	if err != nil {
+		panic(err)
 	}
 
-	fmt.Printf("Total workflow runs: %d\n", totalRuns)
-	fmt.Printf("Total workflow jobs: %d\n", totalJobs)
-	mins := fmt.Sprintf("%.0f mins", allUsage.Minutes())
-	fmt.Printf("Total usage: %s (%s)\n", allUsage.String(), mins)
+	workflowJobHandler := &workflowJobHandler{
+		ClientCreator: cc,
+	}
+
+	webhookHandler := githubapp.NewDefaultEventDispatcher(config.Github, workflowJobHandler)
+
+	http.Handle(githubapp.DefaultWebhookRoute, webhookHandler)
+	http.Handle("/metrics", promhttp.Handler())
+
+	addr := fmt.Sprintf("%s:%d", config.Server.Address, config.Server.Port)
+	logger.Info().Msgf("Starting server on %s...", addr)
+	err = http.ListenAndServe(addr, nil)
+	if err != nil {
+		panic(err)
+	}
 }
